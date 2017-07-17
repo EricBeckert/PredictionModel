@@ -1,0 +1,162 @@
+---
+title: "Predicting exercise execution"
+author: "Eric Becker"
+date: "17 juli 2017"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(caret)
+library(dplyr)
+
+set.seed(1337)
+```
+
+## Overview
+One thing that people regularly do is quantify *how much* of a particular activity they do, but they rarely quantify *how well* they do it. In this project, data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants is used to predict the manner in which they did the exercise.
+
+## Data exploration
+The datasets to construct and test (validate) the prediction model are available through url's provided on the Coursera website.  
+```{r read_data, cache=TRUE}
+df_training <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", 
+                          na.strings = c("NA", "#DIV/0!"), stringsAsFactors = FALSE)
+df_testing <- read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+
+```
+The first observation is that the training dataset appears to be very sparse. It contains `r nrow(df_training)` rows and `r ncol(df_training)` columns. Looking at  
+
+```{r explore, eval=FALSE, include=TRUE, echo=TRUE}
+data.frame(empty_cells = colSums(is.na(df_training)))
+```
+
+we see that a majority of the columns have more than 19200 missing values, that is about 98% of the contents of those columns.  
+Another observation is that some variables can be excluded from the prediction model anyway, because they are not related to the manner of execution of exercises. These are the window and timestamp variables, and X. The user_name variable is arbitrary. If the model is to be used to predict exercises from the same group of 6 people, user_name can be a significant predictor. If, on the other hand, it is meant to predict for any unknown person, it should be left out. A quick peek at the 20 row testing set shows that it contains exactly the same users, so for this assignment the user_name variable stays included.  
+
+## Preparing the data
+The first step is to drop the variables that are useless for the prediction model and make factors of non-numeric variables.  
+```{r drop_useless}
+df_training <- df_training %>% 
+  select(-X, -raw_timestamp_part_1, -raw_timestamp_part_2, -cvtd_timestamp, -new_window, -num_window)
+df_training$user_name <- as.factor(df_training$user_name)
+df_training$classe <- as.factor(df_training$classe)
+
+```
+The second step is about dealing with the sparsity of the data (the many NA values). Because there are `r sum(complete.cases(df_training))` rows with no NA's, it's no use to only keep complete cases. During data exploration we saw that a majority of the variables has about 98% NA's. Bluntly dropping those would practically be throwing away the whole trainig set. So, how can we get the maximum out of it? Replacing NA's with 0's seems a defendable strategy, for the reason that the data contains measures of physical movements. Absence of a measure can very well be replaced by a measure of 0. We do this by:  
+```{r replace_NA}
+df_training[is.na(df_training)] <- 0
+```
+The next step is to drop variables that have a near zero variance (constant or almost constant variables). We run it with the default parameters (freqCut = 95/5, uniqueCut = 10).  
+```{r near_zero_var}
+nzv <- preProcess(df_training, method = "nzv", freqCut = 95/5, uniqueCut = 10)
+df_training <- predict(nzv, df_training)
+```
+This step removes `r length(nzv$method$remove)` variables, which contributes to a much simpler (more parsimonious) model. *(NB: The near zero variance algorithm appears to remove exactly those variables that have so many NA's, so bluntly dropping them might have been a good strategy after all.)*  
+
+## Modeling
+To be able to estimate the out of sample error, we have to split the training set into 2 subsets; one for the actual training of the model and one for testing it. Therefore we divide the data at a 80/20 ratio, maintaining the distribution of the classe target variable (stratified sample).  
+```{r split_train_test}
+# split train and test subsets
+intrain <- createDataPartition(y = df_training$classe , p = 0.8, list = F)
+df_train_subset <- df_training[intrain,]
+df_test_subset <- df_training[-intrain,]
+```
+
+Next, we standardize (center and scale) the data. Note that we must only use the training subset data to determine the standardization parameters (mean and standard deviation). We store it in the prep variable.  
+```{r preprocess}
+# calculate preprocessing (NB: to be applied to test and validation sets as well)
+prep <- preProcess(df_train_subset, method = c("center", "scale"))
+
+# preprocess train subset
+df_train_subset_pp <- predict(prep, df_train_subset)
+```
+
+At this point we have to decide which type of models are appropriate for our prediction problem. Our problem can best be described as classification. For those kind of problems tree-like algorithms are best (decision tree, random forest, gradient boosting). Regression is better for continuous variables, so we will abandon that. We will try different models with several tune lengths and cross validations.  For the cross validation we try two styles: a regular cross validation of 6 folds, plus a repeated cross validation of 6 repreats of a 5-fold split.  
+```{r train_models, cache=TRUE}
+# train control
+control_cv6 <- trainControl(method = "cv", number = 6)
+control_rcv <- trainControl(method = "repeatedcv", number = 5, repeats = 6)
+
+# decision tree (rpart)
+model_rpart_cv6 <- train(classe ~ ., data = df_train_subset_pp, method = "rpart", 
+                         trControl = control_cv6, tuneLength = 5)
+```
+
+```{r train_models2, cache=TRUE}
+model_rpart_cv6_t20 <- train(classe ~ ., data = df_train_subset_pp, method = "rpart", 
+                             trControl = control_cv6, tuneLength = 20)
+```
+
+```{r train_models3, cache=TRUE}
+# random forest (rf)
+model_rf_cv6 <- train(classe ~ ., data = df_train_subset_pp, method = "rf", 
+                      trControl = control_cv6, tuneLength = 5)
+```
+
+```{r train_models4, cache=TRUE}
+model_rf_rcv <- train(classe ~ ., data = df_train_subset_pp, method = "rf", 
+                      trControl = control_rcv, tuneLength = 5)
+```
+
+```{r train_models5, cache=TRUE}
+# gradient boosting (gbm)
+garbage <- capture.output(
+  model_gbm_cv6 <- train(classe ~ ., data = df_train_subset_pp, method = "gbm", 
+                         trControl = control_cv6, tuneLength = 5))
+# the garbage/capture.output wrapper is to prevent the iteration listings of the gbm method,
+# which would otherwise end up in the markup html
+```
+
+After the models have been trained, we can compare their in sample and out of sample performance. The measure we use is Accuracy (percentage correctly predicted values (true positive and true negative) on all observations). The in sample performance is computed by predicting and comparing the outcome on the train subset itself. The out of sample performance is computed by predicting and comparing the outcome on the test subset (after preprocessing).  
+```{r performance, message=FALSE, warning=FALSE}
+# in-sample confusion matrix
+cm_in_rpart_cv6 <- confusionMatrix(df_train_subset_pp$classe, 
+                                   predict(model_rpart_cv6, newdata = df_train_subset_pp ))
+cm_in_rpart_cv6_t20 <- confusionMatrix(df_train_subset_pp$classe, 
+                                       predict(model_rpart_cv6_t20, newdata = df_train_subset_pp ))
+cm_in_rf_cv6 <- confusionMatrix(df_train_subset_pp$classe, 
+                                predict(model_rf_cv6, newdata = df_train_subset_pp ))
+cm_in_rf_rcv <- confusionMatrix(df_train_subset_pp$classe, 
+                                predict(model_rf_rcv, newdata = df_train_subset_pp ))
+cm_in_gbm_cv6 <- confusionMatrix(df_train_subset_pp$classe, 
+                                 predict(model_gbm_cv6, newdata = df_train_subset_pp ))
+# out-sample confusion matrix
+df_test_subset_pp <- predict(prep, df_test_subset) # preprocess first, with train subset standardization parameters(!)
+cm_out_rpart_cv6 <- confusionMatrix(df_test_subset_pp$classe, 
+                                    predict(model_rpart_cv6, newdata = df_test_subset_pp ))
+cm_out_rpart_cv6_t20 <- confusionMatrix(df_test_subset_pp$classe, 
+                                        predict(model_rpart_cv6_t20, newdata = df_test_subset_pp ))
+cm_out_rf_cv6 <- confusionMatrix(df_test_subset_pp$classe, 
+                                 predict(model_rf_cv6, newdata = df_test_subset_pp ))
+cm_out_rf_rcv <- confusionMatrix(df_test_subset_pp$classe, 
+                                 predict(model_rf_rcv, newdata = df_test_subset_pp ))
+cm_out_gbm_cv6 <- confusionMatrix(df_test_subset_pp$classe, 
+                                  predict(model_gbm_cv6, newdata = df_test_subset_pp ))
+# create comparison
+models <- c("model_rpart_cv6", "model_rpart_cv6_t20", "model_rf_cv6", "model_rf_rcv", "model_gbm_cv6")
+in_acc <- c(cm_in_rpart_cv6$overall[[1]],
+            cm_in_rpart_cv6_t20$overall[[1]],
+            cm_in_rf_cv6$overall[[1]],
+            cm_in_rf_rcv$overall[[1]],
+            cm_in_gbm_cv6$overall[[1]]
+)
+out_acc <- c(cm_out_rpart_cv6$overall[[1]],
+             cm_out_rpart_cv6_t20$overall[[1]],
+             cm_out_rf_cv6$overall[[1]],
+             cm_out_rf_rcv$overall[[1]],
+             cm_out_gbm_cv6$overall[[1]]
+)
+cbind(models, in_acc, out_acc)
+```
+The best performing model seems to be a random forest, trained with the repeated cross validation. It has an out os sample accuracy of `r cm_out_rf_rcv$overall[[1]]`. So that's the model we will use to predict the 20 cases in the final Coursera test set.  
+
+## Predicting
+```{r final_prediction}
+df_testing[is.na(df_testing)] <- 0 # replace NA's by 0's
+df_testing_pp <- predict(prep, df_testing) # preprocess, with train subset standardization parameters(!)
+pred_classe <- predict(model_rf_rcv, df_testing_pp) # final prediction
+
+df_testing_final <- cbind(df_testing, pred_classe)
+df_testing_final[, c(1, 2, 161)]
+```
